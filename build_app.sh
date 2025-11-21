@@ -30,7 +30,7 @@ cp "$APP_NAME" "$MACOS_DIR/"
 cp Info.plist "$CONTENTS_DIR/"
 
 # 3b. Process Icon
-ICON_SOURCE="/Users/chrislaidler/.gemini/antigravity/brain/0bbe31f5-51fa-4b8f-bf0c-bbd9e089f265/chrisper_app_icon_1763757392602.png"
+ICON_SOURCE="app_icon.png"
 
 if [ -f "$ICON_SOURCE" ]; then
     echo "Creating AppIcon.icns..."
