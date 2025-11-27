@@ -293,6 +293,15 @@ func (s *Service) transcribeAudio(samples []int16) (string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return "", fmt.Errorf("failed to decode response: %w", err)
 	}
+
+	// Extract text
+	// Response structure: candidates[0].content.parts[0].text
+	if candidates, ok := response["candidates"].([]interface{}); ok && len(candidates) > 0 {
+		if candidate, ok := candidates[0].(map[string]interface{}); ok {
+			if content, ok := candidate["content"].(map[string]interface{}); ok {
+				if parts, ok := content["parts"].([]interface{}); ok && len(parts) > 0 {
+					if part, ok := parts[0].(map[string]interface{}); ok {
+						if text, ok := part["text"].(string); ok {
 							return text, nil
 						}
 					}
