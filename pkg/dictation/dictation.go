@@ -257,15 +257,6 @@ func (s *Service) transcribeAudio(samples []int16) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
-	log.Printf("[Dictation] Request preparation took: %v", time.Since(startPrep))
-
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/%s:generateContent?key=%s", modelName, s.apiKey)
-	
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
 
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/%s:generateContent?key=%s", modelName, s.apiKey)
 	
