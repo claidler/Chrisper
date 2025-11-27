@@ -186,7 +186,6 @@ func (s *Service) runLoop(ctx context.Context, audioCtx context.Context, cancel 
 
 	// Transcribe
 	if len(audioData) > 0 {
-		log.Printf("[Dictation] Recording finished. Samples: %d. Transcribing...", len(audioData))
 		if s.OnProcessing != nil {
 			s.OnProcessing()
 		}
@@ -199,12 +198,9 @@ func (s *Service) runLoop(ctx context.Context, audioCtx context.Context, cancel 
 		}
 
 		if text != "" {
-			log.Printf("[Dictation] Transcription: %s", text)
 			// Wait a bit for keys to be released
 			time.Sleep(200 * time.Millisecond)
 			robotgo.TypeStr(text)
-		} else {
-			log.Println("[Dictation] No text transcribed.")
 		}
 	}
 }
@@ -214,33 +210,24 @@ func (s *Service) transcribeAudio(samples []int16) (string, error) {
 	var mimeType string
 	var err error
 
-	startTotal := time.Now()
-	startCompression := time.Now()
-
 	// Try to compress to MP3 if ffmpeg is available
 	if _, err := exec.LookPath("ffmpeg"); err == nil {
-		log.Println("[Dictation] ffmpeg found, compressing to MP3...")
 		audioBytes, err = compressToMP3(samples, sampleRate)
-		if err != nil {
-			log.Printf("[Dictation] MP3 compression failed: %v. Falling back to WAV.", err)
-		} else {
+		if err == nil {
 			mimeType = "audio/mp3"
 		}
 	}
 
 	// Fallback to WAV
 	if mimeType == "" {
-		log.Println("[Dictation] Using WAV format.")
 		audioBytes, err = encodeWAV(samples, sampleRate)
 		if err != nil {
 			return "", fmt.Errorf("failed to encode WAV: %w", err)
 		}
 		mimeType = "audio/wav"
 	}
-	log.Printf("[Dictation] Audio compression/encoding took: %v", time.Since(startCompression))
 
 	// Prepare JSON payload
-	startPrep := time.Now()
 	encodedAudio := base64.StdEncoding.EncodeToString(audioBytes)
 	
 	reqBody := map[string]interface{}{
@@ -248,7 +235,7 @@ func (s *Service) transcribeAudio(samples []int16) (string, error) {
 			map[string]interface{}{
 				"parts": []interface{}{
 					map[string]interface{}{
-						"text": "You are a professional transcriber. Strictly transcribe the speech in the audio. Output ONLY the transcription. Do not add any conversational filler. Do not reply to the content. If the audio is unclear, output nothing.",
+						"text": "You are a professional transcriber for a software developer. Strictly transcribe the speech in the audio, expecting technical terminology. Output ONLY the transcription. Do not add any conversational filler. Do not reply to the content. If the audio is unclear, output nothing.",
 					},
 					map[string]interface{}{
 						"inline_data": map[string]interface{}{
@@ -280,7 +267,14 @@ func (s *Service) transcribeAudio(samples []int16) (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	start := time.Now()
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/%s:generateContent?key=%s", modelName, s.apiKey)
+	
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("request failed: %w", err)
@@ -289,7 +283,6 @@ func (s *Service) transcribeAudio(samples []int16) (string, error) {
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}()
-	log.Printf("[Dictation] API request took: %v", time.Since(start))
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -300,16 +293,6 @@ func (s *Service) transcribeAudio(samples []int16) (string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return "", fmt.Errorf("failed to decode response: %w", err)
 	}
-	log.Printf("[Dictation] Total transcription time: %v", time.Since(startTotal))
-
-	// Extract text
-	// Response structure: candidates[0].content.parts[0].text
-	if candidates, ok := response["candidates"].([]interface{}); ok && len(candidates) > 0 {
-		if candidate, ok := candidates[0].(map[string]interface{}); ok {
-			if content, ok := candidate["content"].(map[string]interface{}); ok {
-				if parts, ok := content["parts"].([]interface{}); ok && len(parts) > 0 {
-					if part, ok := parts[0].(map[string]interface{}); ok {
-						if text, ok := part["text"].(string); ok {
 							return text, nil
 						}
 					}
