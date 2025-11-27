@@ -71,6 +71,9 @@ func onReady() {
 	service.OnProcessing = func() {
 		systray.SetTitle("Processing...")
 	}
+	service.OnFinish = func() {
+		systray.SetTitle("")
+	}
 	service.OnError = func(err error) {
 		log.Printf("Dictation Error: %v", err)
 		systray.SetTitle("Dictation: Error")

@@ -41,6 +41,7 @@ type Service struct {
 	OnStart      func()
 	OnStop       func()
 	OnProcessing func()
+	OnFinish     func()
 	OnError      func(error)
 }
 
@@ -125,6 +126,9 @@ func (s *Service) runLoop(ctx context.Context, audioCtx context.Context, cancel 
 
 	// Ensure we clean up
 	defer func() {
+		if s.OnFinish != nil {
+			s.OnFinish()
+		}
 		cancel()
 	}()
 
