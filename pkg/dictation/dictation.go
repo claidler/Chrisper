@@ -278,8 +278,8 @@ func (s *Service) transcribeAudio(samples []int16) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
-	// Trace connection reuse
-	req.Header.Set("Content-Type", "application/json"
+	req.Header.Set("Content-Type", "application/json")
+
 	start := time.Now()
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
