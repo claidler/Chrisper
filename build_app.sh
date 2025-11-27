@@ -10,15 +10,15 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 echo "Building $APP_NAME..."
 
 # 1. Build Binary
-# Get Project ID from env
-PROJECT_ID=${GOOGLE_CLOUD_PROJECT}
-if [ -z "$PROJECT_ID" ]; then
-  echo "Warning: GOOGLE_CLOUD_PROJECT is not set. App will require manual config."
+# Get API Key from env
+API_KEY=${GEMINI_API_KEY}
+if [ -z "$API_KEY" ]; then
+  echo "Warning: GEMINI_API_KEY is not set. App will require manual config."
 else
-  echo "Embedding Project ID: $PROJECT_ID"
+  echo "Embedding API Key"
 fi
 
-CGO_ENABLED=1 go build -ldflags "-X main.embeddedProjectID=$PROJECT_ID" -o "$APP_NAME" main.go icon.go
+CGO_ENABLED=1 go build -ldflags "-X main.embeddedAPIKey=$API_KEY" -o "$APP_NAME" main.go icon.go
 
 # 2. Create App Structure
 rm -rf "$APP_DIR"

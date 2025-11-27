@@ -1,127 +1,72 @@
 package dictation
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"strings"
+	"net/http"
+	"os/exec"
+	"strconv"
 	"sync"
 	"time"
 
-	speech "cloud.google.com/go/speech/apiv2"
-	"cloud.google.com/go/speech/apiv2/speechpb"
 	"github.com/go-vgo/robotgo"
 	"github.com/gordonklaus/portaudio"
-	"google.golang.org/api/option"
 )
 
 const (
 	sampleRate      = 16000
 	channelCount    = 1
 	audioBufferSize = 1024
-	modelName       = "chirp_2"
-	languageCode    = "en-GB"
+	modelName       = "models/gemini-2.5-flash-lite-preview-09-2025"
 	defaultGain     = 32.0
 )
 
 // Service handles the dictation logic.
 type Service struct {
-	projectID      string
-	location       string
-	client         *speech.Client
-	recognizerName string
-	
-	isRecording    bool
-	mu             sync.Mutex
-	cancelRecord   context.CancelFunc // Cancels the entire operation (emergency stop)
-	stopAudio      context.CancelFunc // Stops audio sending, triggers graceful shutdown
-	
+	apiKey string
+
+	isRecording  bool
+	mu           sync.Mutex
+	cancelRecord context.CancelFunc // Cancels the entire operation (emergency stop)
+	stopAudio    context.CancelFunc // Stops audio recording, triggers transcription
+	httpClient   *http.Client
+
 	// Callbacks
-	OnStart func()
-	OnStop  func()
-	OnError func(error)
+	OnStart      func()
+	OnStop       func()
+	OnProcessing func()
+	OnError      func(error)
 }
 
 // New creates a new Dictation Service.
-func New(projectID, location string) (*Service, error) {
-	if location == "" {
-		location = "us-central1"
-	}
-	
-	ctx := context.Background()
-	client, err := speech.NewClient(ctx, option.WithEndpoint(fmt.Sprintf("%s-speech.googleapis.com:443", location)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create speech client: %w", err)
+func New(apiKey string) (*Service, error) {
+	if apiKey == "" {
+		return nil, fmt.Errorf("API key is required")
 	}
 
-	// Initialize PortAudio globally (safe to call multiple times? No, usually once per process)
-	// We assume the caller or this package manages it. 
-	// For a package, we might want to Init here and Terminate on Close.
+	// Initialize PortAudio globally
 	if err := portaudio.Initialize(); err != nil {
 		return nil, fmt.Errorf("portaudio init error: %w", err)
 	}
 
 	s := &Service{
-		projectID: projectID,
-		location:  location,
-		client:    client,
+		apiKey:     apiKey,
+		httpClient: &http.Client{Timeout: 120 * time.Second},
 	}
-	
-	if err := s.createRecognizer(ctx); err != nil {
-		return nil, err
-	}
-	
+
 	return s, nil
 }
 
 // Close cleans up resources.
 func (s *Service) Close() {
 	s.StopRecording()
-	if s.client != nil {
-		// Delete recognizer
-		if s.recognizerName != "" {
-			delReq := &speechpb.DeleteRecognizerRequest{Name: s.recognizerName}
-			s.client.DeleteRecognizer(context.Background(), delReq)
-		}
-		s.client.Close()
-	}
 	portaudio.Terminate()
-}
-
-func (s *Service) createRecognizer(ctx context.Context) error {
-	recognizerID := fmt.Sprintf("dictation-cli-%d", time.Now().Unix())
-	parent := fmt.Sprintf("projects/%s/locations/%s", s.projectID, s.location)
-	recognizerName := fmt.Sprintf("%s/recognizers/%s", parent, recognizerID)
-	s.recognizerName = recognizerName
-
-	fmt.Printf("Creating Recognizer: %s\n", recognizerName)
-	req := &speechpb.CreateRecognizerRequest{
-		Parent:       parent,
-		RecognizerId: recognizerID,
-		Recognizer: &speechpb.Recognizer{
-			Model: modelName,
-			LanguageCodes: []string{languageCode},
-			DefaultRecognitionConfig: &speechpb.RecognitionConfig{
-				DecodingConfig: &speechpb.RecognitionConfig_ExplicitDecodingConfig{
-					ExplicitDecodingConfig: &speechpb.ExplicitDecodingConfig{
-						Encoding:          speechpb.ExplicitDecodingConfig_LINEAR16,
-						SampleRateHertz:   sampleRate,
-						AudioChannelCount: channelCount,
-					},
-				},
-			},
-		},
-	}
-
-	op, err := s.client.CreateRecognizer(ctx, req)
-	if err != nil {
-		return fmt.Errorf("failed to create recognizer: %w", err)
-	}
-	if _, err := op.Wait(ctx); err != nil {
-		return fmt.Errorf("failed to wait for recognizer creation: %w", err)
-	}
-	return nil
 }
 
 // ToggleRecording starts or stops recording.
@@ -155,11 +100,11 @@ func (s *Service) startRecordingLocked() {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancelRecord = cancel
 	
-	// Audio context to control just the audio sending
+	// Audio context to control just the audio recording
 	audioCtx, stopAudio := context.WithCancel(ctx)
 	s.stopAudio = stopAudio
 	
-	go s.runLoop(ctx, audioCtx)
+	go s.runLoop(ctx, audioCtx, cancel)
 }
 
 func (s *Service) stopRecordingLocked() {
@@ -168,112 +113,25 @@ func (s *Service) stopRecordingLocked() {
 	}
 	s.isRecording = false
 	
-	// Graceful stop: Stop audio first, let stream finish processing
+	// Stop audio recording, which will trigger transcription in runLoop
 	if s.stopAudio != nil {
 		s.stopAudio()
 		s.stopAudio = nil
 	}
-	
-	// We do NOT cancel s.cancelRecord here immediately.
-	// runLoop will cancel it when it finishes.
 }
 
-func (s *Service) runLoop(ctx context.Context, audioCtx context.Context) {
-	var transcriptBuffer strings.Builder
+func (s *Service) runLoop(ctx context.Context, audioCtx context.Context, cancel context.CancelFunc) {
+	var audioData []int16
 
-	// Ensure we output whatever we have when we exit (stop recording)
+	// Ensure we clean up
 	defer func() {
-		// Ensure main context is cancelled when we exit
-		if s.cancelRecord != nil {
-			s.cancelRecord()
-		}
-
-		finalText := transcriptBuffer.String()
-		log.Printf("[Dictation] Stopping. Buffer length: %d. Content: %q", len(finalText), finalText)
-		if finalText != "" {
-			// Wait a bit for the user to release the hotkeys (Cmd+Shift+Space)
-			// to avoid interference (e.g. Shift+Type = All Caps)
-			time.Sleep(500 * time.Millisecond)
-			
-			log.Println("[Dictation] Typing text...")
-			// Revert to TypeStr as PasteStr (Cmd+V) can be flaky or affected by held keys.
-			robotgo.TypeStr(finalText)
-			log.Println("[Dictation] Typing complete.")
-		} else {
-			log.Println("[Dictation] Buffer empty, nothing to paste.")
-		}
+		cancel()
 	}()
-
-	// Infinite Streaming Loop
-	for {
-		// Check if we should still be recording (check main context)
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		// If audio is stopped (graceful shutdown), we shouldn't restart stream
-		if audioCtx.Err() != nil {
-			return
-		}
-
-		if !s.isRecording {
-			return
-		}
-
-		s.streamLoop(ctx, audioCtx, func(text string) {
-			transcriptBuffer.WriteString(text)
-		})
-		
-		// If we are here, the stream ended. 
-		// If audio is still active, we loop back and restart (Infinite Streaming).
-		if audioCtx.Err() != nil {
-			// Audio stopped, so we are done
-			return
-		}
-
-		// Add a small backoff to prevent tight loops on persistent errors
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func (s *Service) streamLoop(ctx context.Context, audioCtx context.Context, onText func(string)) {
-	stream, err := s.client.StreamingRecognize(ctx)
-	if err != nil {
-		if s.OnError != nil {
-			s.OnError(fmt.Errorf("failed to start stream: %w", err))
-		}
-		return
-	}
-
-	// Send Config
-	// Note: InterimResults = false for "Final Results Only" mode (Stable)
-	if err := stream.Send(&speechpb.StreamingRecognizeRequest{
-		Recognizer: s.recognizerName,
-		StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
-			StreamingConfig: &speechpb.StreamingRecognitionConfig{
-				Config: &speechpb.RecognitionConfig{
-					Features: &speechpb.RecognitionFeatures{
-						EnableAutomaticPunctuation: true,
-					},
-				},
-				StreamingFeatures: &speechpb.StreamingRecognitionFeatures{
-					InterimResults: false, // Changed to false for stable transcription
-				},
-			},
-		},
-	}); err != nil {
-		if s.OnError != nil {
-			s.OnError(fmt.Errorf("failed to send config: %w", err))
-		}
-		return
-	}
 
 	// Audio Setup
 	sampleRateFloat := float64(sampleRate)
 	framesPerBuffer := make([]int16, audioBufferSize)
-	
+
 	paStream, err := portaudio.OpenDefaultStream(channelCount, 0, sampleRateFloat, len(framesPerBuffer), framesPerBuffer)
 	if err != nil {
 		if s.OnError != nil {
@@ -281,94 +139,259 @@ func (s *Service) streamLoop(ctx context.Context, audioCtx context.Context, onTe
 		}
 		return
 	}
-	
+
 	if err := paStream.Start(); err != nil {
 		if s.OnError != nil {
 			s.OnError(fmt.Errorf("failed to start PA stream: %w", err))
 		}
+		paStream.Close()
 		return
 	}
-	defer paStream.Close()
-
-	// Audio Sender
-	// We need a way to stop the sender when the receiver stops or context is done
-	sendErrCh := make(chan error, 1)
 	
-	go func() {
-		defer close(sendErrCh)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-audioCtx.Done():
-				// Audio stopped, close send to tell Google we are done
-				log.Println("[Dictation] Audio stopped, closing send...")
-				stream.CloseSend()
-				return
-			default:
-				if err := paStream.Read(); err != nil {
-					if err != portaudio.InputOverflowed {
-						// log error?
-					}
-				}
-				
-				// Gain Boost
-				for i, sample := range framesPerBuffer {
-					boosted := float64(sample) * defaultGain
-					if boosted > 32767 {
-						boosted = 32767
-					} else if boosted < -32768 {
-						boosted = -32768
-					}
-					framesPerBuffer[i] = int16(boosted)
-				}
-				
-				audioBytes := make([]byte, len(framesPerBuffer)*2)
-				for i, sample := range framesPerBuffer {
-					audioBytes[i*2] = byte(sample)
-					audioBytes[i*2+1] = byte(sample >> 8)
-				}
-				
-				if err := stream.Send(&speechpb.StreamingRecognizeRequest{
-					StreamingRequest: &speechpb.StreamingRecognizeRequest_Audio{
-						Audio: audioBytes,
-					},
-				}); err != nil {
-					// Stream closed or error
-					sendErrCh <- err
-					return
+	// Recording Loop
+	recording := true
+	for recording {
+		select {
+		case <-ctx.Done():
+			recording = false
+		case <-audioCtx.Done():
+			recording = false
+		default:
+			if err := paStream.Read(); err != nil {
+				if err != portaudio.InputOverflowed {
+					log.Printf("PortAudio read error: %v", err)
 				}
 			}
-		}
-	}()
 
-	// Receiver & Typer
-	for {
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			// Check if it's a context error (user stopped recording)
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("Stream receive error: %v", err)
-			break
-		}
-
-		for _, result := range resp.Results {
-			if len(result.Alternatives) == 0 {
-				continue
-			}
-			transcript := result.Alternatives[0].Transcript
-			isFinal := result.IsFinal
-			
-			// Only buffer final results
-			if isFinal && transcript != "" {
-				log.Printf("[Dictation] Got Final Result: %s", transcript)
-				onText(transcript + " ")
+			// Gain Boost and Append
+			for _, sample := range framesPerBuffer {
+				boosted := float64(sample) * defaultGain
+				if boosted > 32767 {
+					boosted = 32767
+				} else if boosted < -32768 {
+					boosted = -32768
+				}
+				audioData = append(audioData, int16(boosted))
 			}
 		}
 	}
+
+	paStream.Stop()
+	paStream.Close()
+
+	// If we were cancelled (emergency stop), don't transcribe
+	if ctx.Err() != nil && audioCtx.Err() == nil {
+		return
+	}
+
+	// Transcribe
+	if len(audioData) > 0 {
+		log.Printf("[Dictation] Recording finished. Samples: %d. Transcribing...", len(audioData))
+		if s.OnProcessing != nil {
+			s.OnProcessing()
+		}
+		text, err := s.transcribeAudio(audioData)
+		if err != nil {
+			if s.OnError != nil {
+				s.OnError(fmt.Errorf("transcription failed: %w", err))
+			}
+			return
+		}
+
+		if text != "" {
+			log.Printf("[Dictation] Transcription: %s", text)
+			// Wait a bit for keys to be released
+			time.Sleep(200 * time.Millisecond)
+			robotgo.TypeStr(text)
+		} else {
+			log.Println("[Dictation] No text transcribed.")
+		}
+	}
+}
+
+func (s *Service) transcribeAudio(samples []int16) (string, error) {
+	var audioBytes []byte
+	var mimeType string
+	var err error
+
+	startTotal := time.Now()
+	startCompression := time.Now()
+
+	// Try to compress to MP3 if ffmpeg is available
+	if _, err := exec.LookPath("ffmpeg"); err == nil {
+		log.Println("[Dictation] ffmpeg found, compressing to MP3...")
+		audioBytes, err = compressToMP3(samples, sampleRate)
+		if err != nil {
+			log.Printf("[Dictation] MP3 compression failed: %v. Falling back to WAV.", err)
+		} else {
+			mimeType = "audio/mp3"
+		}
+	}
+
+	// Fallback to WAV
+	if mimeType == "" {
+		log.Println("[Dictation] Using WAV format.")
+		audioBytes, err = encodeWAV(samples, sampleRate)
+		if err != nil {
+			return "", fmt.Errorf("failed to encode WAV: %w", err)
+		}
+		mimeType = "audio/wav"
+	}
+	log.Printf("[Dictation] Audio compression/encoding took: %v", time.Since(startCompression))
+
+	// Prepare JSON payload
+	startPrep := time.Now()
+	encodedAudio := base64.StdEncoding.EncodeToString(audioBytes)
+	
+	reqBody := map[string]interface{}{
+		"contents": []interface{}{
+			map[string]interface{}{
+				"parts": []interface{}{
+					map[string]interface{}{
+						"text": "You are a professional transcriber. Strictly transcribe the speech in the audio. Output ONLY the transcription. Do not add any conversational filler. Do not reply to the content. If the audio is unclear, output nothing.",
+					},
+					map[string]interface{}{
+						"inline_data": map[string]interface{}{
+							"mime_type": mimeType,
+							"data":      encodedAudio,
+						},
+					},
+				},
+			},
+		},
+		"generation_config": map[string]interface{}{
+			"response_modalities": []string{"TEXT"},
+			"temperature":         0.0,
+			"max_output_tokens":   256,
+		},
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+	log.Printf("[Dictation] Request preparation took: %v", time.Since(startPrep))
+
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/%s:generateContent?key=%s", modelName, s.apiKey)
+	
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	// Trace connection reuse
+	req.Header.Set("Content-Type", "application/json"
+	start := time.Now()
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer func() {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+	log.Printf("[Dictation] API request took: %v", time.Since(start))
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var response map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", fmt.Errorf("failed to decode response: %w", err)
+	}
+	log.Printf("[Dictation] Total transcription time: %v", time.Since(startTotal))
+
+	// Extract text
+	// Response structure: candidates[0].content.parts[0].text
+	if candidates, ok := response["candidates"].([]interface{}); ok && len(candidates) > 0 {
+		if candidate, ok := candidates[0].(map[string]interface{}); ok {
+			if content, ok := candidate["content"].(map[string]interface{}); ok {
+				if parts, ok := content["parts"].([]interface{}); ok && len(parts) > 0 {
+					if part, ok := parts[0].(map[string]interface{}); ok {
+						if text, ok := part["text"].(string); ok {
+							return text, nil
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return "", nil
+}
+
+func compressToMP3(samples []int16, sampleRate int) ([]byte, error) {
+	cmd := exec.Command("ffmpeg", 
+		"-f", "s16le", 
+		"-ar", strconv.Itoa(sampleRate), 
+		"-ac", "1", 
+		"-i", "pipe:0", 
+		"-ar", "8000", // Downsample to 8kHz
+		"-f", "mp3", 
+		"-map_metadata", "-1", // Strip metadata
+		"-b:a", "8k", // 8kbps for maximum compression
+		"pipe:1")
+	
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	
+	go func() {
+		defer stdin.Close()
+		// Convert []int16 to []byte (Little Endian)
+		buf := make([]byte, len(samples)*2)
+		for i, sample := range samples {
+			buf[i*2] = byte(sample)
+			buf[i*2+1] = byte(sample >> 8)
+		}
+		stdin.Write(buf)
+	}()
+	
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffmpeg error: %v, stderr: %s", err, stderr.String())
+	}
+	
+	return out.Bytes(), nil
+}
+
+func encodeWAV(samples []int16, sampleRate int) ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// WAV Header
+	// RIFF chunk
+	buf.WriteString("RIFF")
+	totalDataLen := len(samples) * 2
+	fileSize := 36 + totalDataLen
+	binary.Write(buf, binary.LittleEndian, int32(fileSize))
+	buf.WriteString("WAVE")
+
+	// fmt chunk
+	buf.WriteString("fmt ")
+	binary.Write(buf, binary.LittleEndian, int32(16)) // Chunk size
+	binary.Write(buf, binary.LittleEndian, int16(1))  // Audio format (1 = PCM)
+	binary.Write(buf, binary.LittleEndian, int16(1))  // Num channels
+	binary.Write(buf, binary.LittleEndian, int32(sampleRate))
+	byteRate := sampleRate * 1 * 16 / 8
+	binary.Write(buf, binary.LittleEndian, int32(byteRate))
+	blockAlign := 1 * 16 / 8
+	binary.Write(buf, binary.LittleEndian, int16(blockAlign))
+	binary.Write(buf, binary.LittleEndian, int16(16)) // Bits per sample
+
+	// data chunk
+	buf.WriteString("data")
+	binary.Write(buf, binary.LittleEndian, int32(totalDataLen))
+
+	// Write samples
+	for _, sample := range samples {
+		binary.Write(buf, binary.LittleEndian, sample)
+	}
+
+	return buf.Bytes(), nil
 }

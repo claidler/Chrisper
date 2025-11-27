@@ -13,8 +13,8 @@ import (
 
 var (
 	service *dictation.Service
-	// embeddedProjectID can be set via -ldflags "-X main.embeddedProjectID=..."
-	embeddedProjectID string
+	// embeddedAPIKey can be set via -ldflags "-X main.embeddedAPIKey=..."
+	embeddedAPIKey string
 )
 
 func main() {
@@ -41,19 +41,18 @@ func onReady() {
 	mQuit := systray.AddMenuItem("Quit", "Quit the application")
 
 	// 1. Initialize Dictation Service
-	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT")
-	if projectID == "" {
-		if embeddedProjectID != "" {
-			projectID = embeddedProjectID
-			log.Printf("Using embedded Project ID: %s\n", projectID)
+	apiKey := os.Getenv("GEMINI_API_KEY")
+	if apiKey == "" {
+		if embeddedAPIKey != "" {
+			apiKey = embeddedAPIKey
+			log.Printf("Using embedded API Key\n")
 		} else {
-			log.Fatal("Please set GOOGLE_CLOUD_PROJECT environment variable.")
+			log.Fatal("Please set GEMINI_API_KEY environment variable.")
 		}
 	}
-	location := os.Getenv("GOOGLE_CLOUD_LOCATION")
-	
+
 	var err error
-	service, err = dictation.New(projectID, location)
+	service, err = dictation.New(apiKey)
 	if err != nil {
 		log.Fatalf("Failed to initialize dictation service: %v", err)
 	}
@@ -68,6 +67,9 @@ func onReady() {
 		fmt.Println("Recording Stopped")
 		systray.SetTitle("")
 		systray.SetIcon(iconIdle)
+	}
+	service.OnProcessing = func() {
+		systray.SetTitle("Processing...")
 	}
 	service.OnError = func(err error) {
 		log.Printf("Dictation Error: %v", err)
